@@ -14,7 +14,7 @@ pub const GitTool = struct {
     pub const tool_name = "git_operations";
     pub const tool_description = "Perform structured Git operations (status, diff, log, branch, commit, add, checkout, stash).";
     pub const tool_params =
-        \\{"type":"object","properties":{"operation":{"type":"string","enum":["status","diff","log","branch","commit","add","checkout","stash"],"description":"Git operation to perform"},"message":{"type":"string","description":"Commit message (for commit)"},"paths":{"type":"array","items":{"type":"string"},"description":"File paths (for add)"},"branch":{"type":"string","description":"Branch name (for checkout)"},"files":{"type":"array","items":{"type":"string"},"description":"Files to diff"},"cached":{"type":"boolean","description":"Show staged changes (diff)"},"limit":{"type":"integer","description":"Log entry count (default: 10)"},"cwd":{"type":"string","description":"Repository directory (absolute path within allowed paths; defaults to workspace)"}},"required":["operation"]}
+        \\{"type":"object","properties":{"operation":{"type":"string","enum":["status","diff","log","branch","commit","add","checkout","stash"],"description":"Git operation to perform"},"message":{"type":"string","description":"Commit message (for commit)"},"paths":{"oneOf":[{"type":"string"},{"type":"array","items":{"type":"string"}}],"description":"File paths (for add). Prefer array for multiple files."},"branch":{"type":"string","description":"Branch name (for checkout)"},"files":{"oneOf":[{"type":"string"},{"type":"array","items":{"type":"string"}}],"description":"Files to diff. Prefer array for multiple files."},"cached":{"type":"boolean","description":"Show staged changes (diff)"},"limit":{"type":"integer","description":"Log entry count (default: 10)"},"cwd":{"type":"string","description":"Repository directory (absolute path within allowed paths; defaults to workspace)"}},"required":["operation"]}
     ;
 
     const vtable = root.ToolVTable(@This());
@@ -105,7 +105,7 @@ pub const GitTool = struct {
             return ToolResult.fail("Missing 'operation' parameter");
 
         // Sanitize all string arguments before execution
-        const string_fields = [_][]const u8{ "message", "branch", "action" };
+        const string_fields = [_][]const u8{ "message", "paths", "branch", "files", "action" };
         for (string_fields) |field| {
             if (root.getString(args, field)) |val| {
                 if (!sanitizeGitArgs(val))
@@ -198,9 +198,11 @@ pub const GitTool = struct {
     fn gitDiff(self: *GitTool, allocator: std.mem.Allocator, git_cwd: []const u8, args: JsonObjectMap) !ToolResult {
         const cached = root.getBool(args, "cached") orelse false;
         const file_items = root.getStringArray(args, "files");
+        const file_string = root.getString(args, "files");
 
         var argv_buf: [30][]const u8 = undefined;
         var argc: usize = 0;
+        var added_files: usize = 0;
         argv_buf[argc] = "diff";
         argc += 1;
         argv_buf[argc] = "--unified=3";
@@ -217,9 +219,15 @@ pub const GitTool = struct {
                 if (item == .string) {
                     argv_buf[argc] = item.string;
                     argc += 1;
+                    added_files += 1;
                 }
             }
-        } else {
+        } else if (file_string) |f| {
+            argv_buf[argc] = f;
+            argc += 1;
+            added_files += 1;
+        }
+        if (added_files == 0) {
             argv_buf[argc] = ".";
             argc += 1;
         }
@@ -277,21 +285,33 @@ pub const GitTool = struct {
     }
 
     fn gitAdd(self: *GitTool, allocator: std.mem.Allocator, git_cwd: []const u8, args: JsonObjectMap) !ToolResult {
-        const path_items = root.getStringArray(args, "paths") orelse
+        const path_items = root.getStringArray(args, "paths");
+        const path_string = root.getString(args, "paths");
+        if (path_items == null and path_string == null)
             return ToolResult.fail("Missing 'paths' parameter for add");
 
         var argv_buf: [30][]const u8 = undefined;
         argv_buf[0] = "add";
         argv_buf[1] = "--";
         var argc: usize = 2;
-        for (path_items) |item| {
-            if (argc >= argv_buf.len) break;
-            if (item == .string) {
-                argv_buf[argc] = item.string;
+        var added_paths: usize = 0;
+        if (path_items) |items| {
+            for (items) |item| {
+                if (argc >= argv_buf.len) break;
+                if (item == .string) {
+                    argv_buf[argc] = item.string;
+                    argc += 1;
+                    added_paths += 1;
+                }
+            }
+        } else if (path_string) |p| {
+            if (argc < argv_buf.len) {
+                argv_buf[argc] = p;
                 argc += 1;
+                added_paths += 1;
             }
         }
-        if (argc == 2)
+        if (added_paths == 0)
             return ToolResult.fail("Missing 'paths' parameter for add");
 
         const result = try self.runGit(allocator, git_cwd, argv_buf[0..argc]);
@@ -305,11 +325,16 @@ pub const GitTool = struct {
         var summary = std.ArrayListUnmanaged(u8).empty;
         defer summary.deinit(allocator);
         try summary.appendSlice(allocator, "Staged:");
-        for (path_items) |item| {
-            if (item == .string) {
-                try summary.appendSlice(allocator, " ");
-                try summary.appendSlice(allocator, item.string);
+        if (path_items) |items| {
+            for (items) |item| {
+                if (item == .string) {
+                    try summary.appendSlice(allocator, " ");
+                    try summary.appendSlice(allocator, item.string);
+                }
             }
+        } else if (path_string) |p| {
+            try summary.appendSlice(allocator, " ");
+            try summary.appendSlice(allocator, p);
         }
         const out = try allocator.dupe(u8, summary.items);
         return ToolResult{ .success = true, .output = out };
@@ -511,6 +536,24 @@ test "git add empty paths array" {
     try std.testing.expect(!result.success);
 }
 
+test "git add accepts string paths parameter" {
+    var gt = GitTool{ .workspace_dir = "/tmp" };
+    const t = gt.tool();
+    const parsed = try root.parseTestArgs("{\"operation\": \"add\", \"paths\": \"file.txt\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+    var error_msg_to_free: ?[]const u8 = null;
+    if (result.error_msg) |e| {
+        if (!std.mem.eql(u8, e, "Missing 'paths' parameter for add"))
+            error_msg_to_free = e;
+    }
+    defer if (error_msg_to_free) |e| std.testing.allocator.free(e);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(result.error_msg != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "Missing 'paths' parameter") == null);
+}
+
 // ── sanitizeGitArgs tests ───────────────────────────────────────────
 
 test "sanitizeGitArgs blocks --exec=cmd" {
@@ -644,6 +687,26 @@ test "git execute blocks unsafe args in paths" {
     var gt = GitTool{ .workspace_dir = "/tmp" };
     const t = gt.tool();
     const parsed = try root.parseTestArgs("{\"operation\": \"add\", \"paths\": [\"file.txt; rm -rf /\"]}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "Unsafe") != null);
+}
+
+test "git execute blocks unsafe args in paths string" {
+    var gt = GitTool{ .workspace_dir = "/tmp" };
+    const t = gt.tool();
+    const parsed = try root.parseTestArgs("{\"operation\": \"add\", \"paths\": \"file.txt; rm -rf /\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "Unsafe") != null);
+}
+
+test "git execute blocks unsafe args in files string" {
+    var gt = GitTool{ .workspace_dir = "/tmp" };
+    const t = gt.tool();
+    const parsed = try root.parseTestArgs("{\"operation\": \"diff\", \"files\": \"src/main.zig; rm -rf /\"}");
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
     try std.testing.expect(!result.success);
