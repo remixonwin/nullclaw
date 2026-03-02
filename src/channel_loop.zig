@@ -28,6 +28,69 @@ const channels_mod = @import("channels/root.zig");
 const Atomic = @import("portable_atomic.zig").Atomic;
 
 const log = std.log.scoped(.channel_loop);
+
+// ════════════════════════════════════════════════════════════════════════════
+// Parallel Message Processing
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Task context for processing a message in a worker thread.
+const MessageTask = struct {
+    allocator: std.mem.Allocator,
+    runtime: *ChannelRuntime,
+    tg_ptr: *telegram.TelegramChannel,
+    session_key: []const u8,
+    content: []const u8,
+    sender: []const u8,
+    message_id: ?i64,
+    is_group: bool,
+    reply_to_id: ?i64,
+    first_name: ?[]const u8,
+    message_sender_id: []const u8,
+
+    fn run(task: *MessageTask) void {
+        const allocator = task.allocator;
+
+        const typing_target = task.sender;
+        task.tg_ptr.startTyping(typing_target) catch {};
+        defer task.tg_ptr.stopTyping(typing_target) catch {};
+
+        const reply = task.runtime.session_mgr.processMessage(task.session_key, task.content, null) catch |err| {
+            log.err("Agent error in worker thread: {}", .{err});
+            const err_msg: []const u8 = switch (err) {
+                error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError => "Network error. Please try again.",
+                error.ProviderDoesNotSupportVision => "The current provider does not support image input. Switch to a vision-capable provider or remove [IMAGE:] attachments.",
+                error.NoResponseContent => "Model returned an empty response. Please retry or /new for a fresh session.",
+                error.AllProvidersFailed => "All configured providers failed for this request. Check model/provider compatibility and credentials.",
+                error.OutOfMemory => "Out of memory.",
+                else => "An error occurred. Try again or /new for a fresh session.",
+            };
+            task.tg_ptr.sendMessageWithReply(task.sender, err_msg, task.reply_to_id) catch |send_err| log.err("failed to send error reply: {}", .{send_err});
+            return;
+        };
+        defer allocator.free(reply);
+
+        task.tg_ptr.sendAssistantMessageWithReply(task.sender, task.message_sender_id, task.is_group, reply, task.reply_to_id) catch |err| {
+            log.warn("Send error in worker thread: {}", .{err});
+        };
+    }
+
+    fn deinit(self: *MessageTask) void {
+        self.allocator.free(self.session_key);
+        self.allocator.free(self.content);
+        self.allocator.free(self.sender);
+        if (self.first_name) |name| self.allocator.free(name);
+        self.allocator.free(self.message_sender_id);
+    }
+};
+
+/// Wrapper for thread spawn compatibility
+fn messageTaskWorker(task_ptr: *MessageTask) void {
+    defer {
+        task_ptr.deinit();
+        task_ptr.allocator.destroy(task_ptr);
+    }
+    task_ptr.run();
+}
 const TELEGRAM_OFFSET_STORE_VERSION: i64 = 1;
 
 fn extractTelegramBotId(bot_token: []const u8) ?[]const u8 {
@@ -405,6 +468,9 @@ pub fn runTelegramLoop(
     // Update activity timestamp at start
     loop_state.last_activity.store(std.time.timestamp(), .release);
 
+    // Check if parallel processing is enabled
+    const enable_parallel = config.session.max_concurrent_tasks > 1;
+
     while (!loop_state.stop_requested.load(.acquire) and !daemon.isShutdownRequested()) {
         const messages = tg_ptr.pollUpdates(allocator) catch |err| {
             log.warn("Telegram poll error: {}", .{err});
@@ -417,7 +483,7 @@ pub fn runTelegramLoop(
         loop_state.last_activity.store(std.time.timestamp(), .release);
 
         for (messages) |msg| {
-            // Handle /start command
+            // Handle /start command (always synchronous, quick response)
             const trimmed = std.mem.trim(u8, msg.content, " \t\r\n");
             if (std.mem.eql(u8, trimmed, "/start")) {
                 var greeting_buf: [512]u8 = undefined;
@@ -446,28 +512,91 @@ pub fn runTelegramLoop(
                 break :blk route.session_key;
             };
 
-            const typing_target = msg.sender;
-            tg_ptr.startTyping(typing_target) catch {};
-            defer tg_ptr.stopTyping(typing_target) catch {};
-
-            const reply = runtime.session_mgr.processMessage(session_key, msg.content, null) catch |err| {
-                log.err("Agent error: {}", .{err});
-                const err_msg: []const u8 = switch (err) {
-                    error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError => "Network error. Please try again.",
-                    error.ProviderDoesNotSupportVision => "The current provider does not support image input. Switch to a vision-capable provider or remove [IMAGE:] attachments.",
-                    error.NoResponseContent => "Model returned an empty response. Please retry or /new for a fresh session.",
-                    error.AllProvidersFailed => "All configured providers failed for this request. Check model/provider compatibility and credentials.",
-                    error.OutOfMemory => "Out of memory.",
-                    else => "An error occurred. Try again or /new for a fresh session.",
+            if (enable_parallel) {
+                // Spawn a new thread for parallel message processing
+                // Each session is still serialized via Session.mutex inside processMessage
+                const task = allocator.create(MessageTask) catch |err| {
+                    log.err("Failed to allocate task: {}, falling back to synchronous", .{err});
+                    // Fall through to synchronous processing
+                    continue;
                 };
-                tg_ptr.sendMessageWithReply(msg.sender, err_msg, reply_to_id) catch |send_err| log.err("failed to send error reply: {}", .{send_err});
-                continue;
-            };
-            defer allocator.free(reply);
 
-            tg_ptr.sendAssistantMessageWithReply(msg.sender, msg.id, msg.is_group, reply, reply_to_id) catch |err| {
-                log.warn("Send error: {}", .{err});
-            };
+                // Duplicate strings for task ownership
+                const task_session_key = allocator.dupe(u8, session_key) catch |err| {
+                    log.err("Failed to duplicate session key: {}, falling back to synchronous", .{err});
+                    allocator.destroy(task);
+                    continue;
+                };
+                const task_content = allocator.dupe(u8, msg.content) catch |err| {
+                    log.err("Failed to duplicate content: {}, falling back to synchronous", .{err});
+                    allocator.free(task_session_key);
+                    allocator.destroy(task);
+                    continue;
+                };
+                const task_sender = allocator.dupe(u8, msg.sender) catch |err| {
+                    log.err("Failed to duplicate sender: {}, falling back to synchronous", .{err});
+                    allocator.free(task_session_key);
+                    allocator.free(task_content);
+                    allocator.destroy(task);
+                    continue;
+                };
+                const task_first_name = if (msg.first_name) |fnm| allocator.dupe(u8, fnm) catch null else null;
+                const task_message_sender_id = allocator.dupe(u8, msg.id) catch |err| {
+                    log.err("Failed to duplicate message id: {}, falling back to synchronous", .{err});
+                    allocator.free(task_session_key);
+                    allocator.free(task_content);
+                    allocator.free(task_sender);
+                    if (task_first_name) |n| allocator.free(n);
+                    allocator.destroy(task);
+                    continue;
+                };
+
+                task.* = .{
+                    .allocator = allocator,
+                    .runtime = runtime,
+                    .tg_ptr = tg_ptr,
+                    .session_key = task_session_key,
+                    .content = task_content,
+                    .sender = task_sender,
+                    .message_id = msg.message_id,
+                    .is_group = msg.is_group,
+                    .reply_to_id = reply_to_id,
+                    .first_name = task_first_name,
+                    .message_sender_id = task_message_sender_id,
+                };
+
+                const thread = std.Thread.spawn(.{}, messageTaskWorker, .{task}) catch |err| {
+                    log.err("Failed to spawn worker thread: {}", .{err});
+                    task.deinit();
+                    allocator.destroy(task);
+                    continue;
+                };
+                thread.detach();
+            } else {
+                // Synchronous processing (original behavior)
+                const typing_target = msg.sender;
+                tg_ptr.startTyping(typing_target) catch {};
+                defer tg_ptr.stopTyping(typing_target) catch {};
+
+                const reply = runtime.session_mgr.processMessage(session_key, msg.content, null) catch |err| {
+                    log.err("Agent error: {}", .{err});
+                    const err_msg: []const u8 = switch (err) {
+                        error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError => "Network error. Please try again.",
+                        error.ProviderDoesNotSupportVision => "The current provider does not support image input. Switch to a vision-capable provider or remove [IMAGE:] attachments.",
+                        error.NoResponseContent => "Model returned an empty response. Please retry or /new for a fresh session.",
+                        error.AllProvidersFailed => "All configured providers failed for this request. Check model/provider compatibility and credentials.",
+                        error.OutOfMemory => "Out of memory.",
+                        else => "An error occurred. Try again or /new for a fresh session.",
+                    };
+                    tg_ptr.sendMessageWithReply(msg.sender, err_msg, reply_to_id) catch |send_err| log.err("failed to send error reply: {}", .{send_err});
+                    continue;
+                };
+                defer allocator.free(reply);
+
+                tg_ptr.sendAssistantMessageWithReply(msg.sender, msg.id, msg.is_group, reply, reply_to_id) catch |err| {
+                    log.warn("Send error: {}", .{err});
+                };
+            }
         }
 
         if (messages.len > 0) {

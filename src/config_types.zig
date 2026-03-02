@@ -1215,6 +1215,10 @@ pub const SessionConfig = struct {
     idle_minutes: u32 = 60,
     identity_links: []const IdentityLink = &.{},
     typing_interval_secs: u32 = 5,
+    /// Maximum concurrent message processing tasks per channel.
+    /// When set to 0 or 1, messages are processed sequentially.
+    /// Higher values enable parallel processing across different sessions.
+    max_concurrent_tasks: u32 = 4,
 };
 
 test "WebConfig defaults" {
