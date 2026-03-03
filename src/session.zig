@@ -887,6 +887,46 @@ test "usage ledger resets when byte limit would be exceeded" {
     try testing.expect(std.mem.indexOf(u8, content, "\"success\":true") != null);
 }
 
+test "usage ledger records failed response flag" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(base);
+    const config_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{base});
+    defer testing.allocator.free(config_path);
+    const ledger_path = try std.fmt.allocPrint(testing.allocator, "{s}/{s}", .{ base, TOKEN_USAGE_LEDGER_FILENAME });
+    defer testing.allocator.free(ledger_path);
+
+    var cfg = testConfig();
+    cfg.workspace_dir = base;
+    cfg.config_path = config_path;
+    cfg.diagnostics.token_usage_ledger_enabled = true;
+    cfg.diagnostics.token_usage_ledger_window_hours = 0;
+    cfg.diagnostics.token_usage_ledger_max_lines = 0;
+    cfg.diagnostics.token_usage_ledger_max_bytes = 0;
+
+    var mock = MockProvider{ .response = "ok" };
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    sm.appendUsageRecord(.{
+        .ts = 31,
+        .provider = "p1",
+        .model = "m1",
+        .usage = .{ .prompt_tokens = 0, .completion_tokens = 0, .total_tokens = 0 },
+        .success = false,
+    });
+
+    const file = try std.fs.openFileAbsolute(ledger_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(testing.allocator, 64 * 1024);
+    defer testing.allocator.free(content);
+
+    try testing.expect(std.mem.indexOf(u8, content, "\"ts\":31") != null);
+    try testing.expect(std.mem.indexOf(u8, content, "\"success\":false") != null);
+}
+
 test "getOrCreate creates new session for unknown key" {
     var mock = MockProvider{ .response = "ok" };
     const cfg = testConfig();

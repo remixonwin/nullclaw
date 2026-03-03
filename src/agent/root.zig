@@ -850,6 +850,7 @@ pub const Agent = struct {
                         .error_message = @errorName(err),
                     } };
                     self.observer.recordEvent(&fail_event);
+                    self.emitUsageFailure();
                     return err;
                 };
                 response = ChatResponse{
@@ -908,7 +909,10 @@ pub const Agent = struct {
                             },
                             self.model_name,
                             self.temperature,
-                        ) catch return err;
+                        ) catch |retry_after_compact_err| {
+                            self.emitUsageFailure();
+                            return retry_after_compact_err;
+                        };
                     }
 
                     // Retry once
@@ -949,8 +953,12 @@ pub const Agent = struct {
                                 },
                                 self.model_name,
                                 self.temperature,
-                            ) catch return retry_err;
+                            ) catch |retry_after_compact_err| {
+                                self.emitUsageFailure();
+                                return retry_after_compact_err;
+                            };
                         }
+                        self.emitUsageFailure();
                         return retry_err;
                     };
                 };
@@ -1591,6 +1599,14 @@ pub const Agent = struct {
             .usage = response.usage,
             .success = success,
         });
+    }
+
+    fn emitUsageFailure(self: *Agent) void {
+        const failed = ChatResponse{
+            .model = self.model_name,
+            .usage = .{},
+        };
+        self.emitUsageRecord(&failed, false);
     }
 
     /// Build provider-ready ChatMessage slice from owned history.

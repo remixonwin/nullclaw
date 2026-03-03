@@ -83,7 +83,16 @@ fn runCommandProbe(allocator: std.mem.Allocator, argv: []const []const u8, timeo
     const watchdog = struct {
         fn run(ctx: WatchdogCtx) void {
             if (ctx.timeout_secs == 0) return;
-            std.Thread.sleep(ctx.timeout_secs * std.time.ns_per_s);
+            const timeout_ns = ctx.timeout_secs * std.time.ns_per_s;
+            const tick_ns: u64 = 100 * std.time.ns_per_ms;
+            var elapsed_ns: u64 = 0;
+            while (elapsed_ns < timeout_ns) {
+                if (ctx.finished.load(.acquire)) return;
+                const remaining = timeout_ns - elapsed_ns;
+                const step = if (remaining < tick_ns) remaining else tick_ns;
+                std.Thread.sleep(step);
+                elapsed_ns += step;
+            }
             if (ctx.finished.load(.acquire)) return;
             ctx.timed_out.store(true, .release);
             _ = ctx.child.kill() catch {};
