@@ -214,8 +214,9 @@ fn mix64(x_raw: u64) u64 {
 }
 
 fn projectionCoeff(bit_idx: u32, dim_idx: usize) f64 {
-    const seed_a = @as(u64, bit_idx) * 0x9E3779B185EBCA87;
-    const seed_b = @as(u64, @intCast(dim_idx)) * 0xC2B2AE3D27D4EB4F;
+    const seed_a = @as(u64, bit_idx) *% 0x9E3779B185EBCA87;
+    const dim_u64 = @as(u64, @truncate(dim_idx));
+    const seed_b = dim_u64 *% 0xC2B2AE3D27D4EB4F;
     const hashed = mix64(seed_a ^ seed_b ^ 0xD6E8FEB86659FD93);
     const unit = @as(f64, @floatFromInt(hashed & 0xFFFF)) / 65535.0;
     return (unit * 2.0) - 1.0;
@@ -1097,6 +1098,22 @@ test "ann candidate limit respects multiplier and minimum" {
     try std.testing.expectEqual(@as(u32, 64), annCandidateLimit(1, 4, 64));
     try std.testing.expectEqual(@as(u32, 120), annCandidateLimit(10, 12, 64));
     try std.testing.expectEqual(@as(u32, 20), annCandidateLimit(10, 2, 5));
+}
+
+test "projection coeff handles large dimension indices without overflow" {
+    const indices = [_]usize{
+        0,
+        1,
+        65_535,
+        std.math.maxInt(u32),
+        @as(usize, std.math.maxInt(u32)) + 1,
+        std.math.maxInt(usize),
+    };
+    for (indices) |dim_idx| {
+        const coeff = projectionCoeff(63, dim_idx);
+        try std.testing.expect(std.math.isFinite(coeff));
+        try std.testing.expect(coeff >= -1.0 and coeff <= 1.0);
+    }
 }
 
 test "sqlite ann search falls back to exact when ann index has no candidates" {
