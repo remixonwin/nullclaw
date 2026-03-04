@@ -1,7 +1,16 @@
 import React, { useState, useEffect } from 'react';
-import { MessageList } from './components/MessageList';
-import { MessageInput } from './components/MessageInput';
-import { ConnectionStatus } from './components/ConnectionStatus';
+import { Navigation } from './components/Navigation';
+import { ChatPage } from './pages/ChatPage';
+import { AgentsPage } from './pages/AgentsPage';
+import { ChannelsPage } from './pages/ChannelsPage';
+import { SkillsPage } from './pages/SkillsPage';
+import { CronPage } from './pages/CronPage';
+import { HardwarePage } from './pages/HardwarePage';
+import { MemoryPage } from './pages/MemoryPage';
+import { WorkspacePage } from './pages/WorkspacePage';
+import { ConfigPage } from './pages/ConfigPage';
+import { StatusPage } from './pages/StatusPage';
+import { ToolsPage } from './pages/ToolsPage';
 import { useChatStore } from './store/chatStore';
 import { WebSocketClient } from './lib/websocket-client';
 import { WebSocketMessage } from './types';
@@ -10,6 +19,7 @@ const App = () => {
   const [isConnected, setIsConnected] = useState(false);
   const [pairingCode, setPairingCode] = useState('');
   const [accessToken, setAccessToken] = useState('');
+  const [activeTab, setActiveTab] = useState('chat');
   const { messages, addMessage } = useChatStore();
   
   const [wsClient, setWsClient] = useState<WebSocketClient | null>(null);
@@ -86,35 +96,31 @@ const App = () => {
     }
   };
 
-  const handleMessageSend = (content: string) => {
-    if (wsClient && accessToken) {
-      // Add user message to UI immediately
-      const userMessage = {
-        id: Date.now().toString(),
-        content,
-        sender: 'user' as const,
-        timestamp: new Date(),
-      };
-      addMessage(userMessage);
-      
-      // Send to gateway
-      wsClient.sendUserMessage(content, accessToken);
-    }
-  };
-
   return (
     <div className="min-h-screen bg-gray-50 flex flex-col">
-      {/* Header */}
-      <header className="bg-white shadow-sm py-4 px-6">
-        <div className="max-w-4xl mx-auto flex justify-between items-center">
-          <h1 className="text-xl font-bold text-gray-900">NullClaw Web UI</h1>
-          <ConnectionStatus isConnected={isConnected} />
-        </div>
-      </header>
+      {/* Navigation */}
+      <Navigation activeTab={activeTab} setActiveTab={setActiveTab} />
+      
+      {/* Main Content */}
+      <main className="flex-1 flex flex-col max-w-6xl mx-auto w-full">
+        {activeTab === 'chat' && (
+          <ChatPage wsClient={wsClient} isConnected={isConnected} accessToken={accessToken} />
+        )}
+        {activeTab === 'agents' && <AgentsPage />}
+        {activeTab === 'channels' && <ChannelsPage />}
+        {activeTab === 'skills' && <SkillsPage />}
+        {activeTab === 'cron' && <CronPage />}
+        {activeTab === 'hardware' && <HardwarePage />}
+        {activeTab === 'memory' && <MemoryPage />}
+        {activeTab === 'workspace' && <WorkspacePage />}
+        {activeTab === 'config' && <ConfigPage />}
+        {activeTab === 'status' && <StatusPage />}
+        {activeTab === 'tools' && <ToolsPage />}
+      </main>
 
-      {/* Pairing Section - Only shown if not connected */}
-      {!accessToken && (
-        <div className="bg-blue-50 p-4 border-b">
+      {/* Pairing Section - Only shown if not connected and on chat page */}
+      {!accessToken && activeTab === 'chat' && (
+        <div className="bg-blue-50 p-4 border-t">
           <div className="max-w-4xl mx-auto">
             <h2 className="text-lg font-medium text-blue-900 mb-2">Connect to NullClaw</h2>
             <div className="flex gap-2">
@@ -138,14 +144,6 @@ const App = () => {
           </div>
         </div>
       )}
-
-      {/* Main Content */}
-      <main className="flex-1 flex flex-col max-w-4xl mx-auto w-full">
-        <MessageList messages={messages} />
-        {accessToken && (
-          <MessageInput onSendMessage={handleMessageSend} disabled={!isConnected} />
-        )}
-      </main>
     </div>
   );
 };
